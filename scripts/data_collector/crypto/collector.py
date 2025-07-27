@@ -14,47 +14,68 @@ sys.path.append(str(CUR_DIR.parent.parent))
 from data_collector.base import BaseCollector, BaseNormalize, BaseRun
 from data_collector.utils import deco_retry
 
-from pycoingecko import CoinGeckoAPI
-from time import mktime
-from datetime import datetime as dt
+import requests
 import time
+from datetime import datetime as dt
+from typing import Optional, Dict, Any
 
 
-_CG_CRYPTO_SYMBOLS = None
+_CB_CRYPTO_SYMBOLS = None
 
 
-def get_cg_crypto_symbols(qlib_data_path: [str, Path] = None) -> list:
-    """get crypto symbols in coingecko
+def get_cb_crypto_symbols(qlib_data_path: [str, Path] = None) -> list:
+    """get crypto symbols from Coinbase
 
     Returns
     -------
-        crypto symbols in given exchanges list of coingecko
+        crypto symbols available on Coinbase
     """
-    global _CG_CRYPTO_SYMBOLS  # pylint: disable=W0603
+    global _CB_CRYPTO_SYMBOLS  # pylint: disable=W0603
 
     @deco_retry
-    def _get_coingecko():
+    def _get_coinbase_products():
         try:
-            cg = CoinGeckoAPI()
-            resp = pd.DataFrame(cg.get_coins_markets(vs_currency="usd"))
+            # Coinbase API endpoint for products
+            url = "https://api.exchange.coinbase.com/products"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            resp = requests.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            products = resp.json()
+            
+            # Filter for USD pairs and extract base currency
+            usd_pairs = [product['base_currency'] for product in products 
+                        if product['quote_currency'] == 'USD' and product['status'] == 'online']
+            
+            # Remove duplicates and sort
+            _symbols = sorted(set(usd_pairs))
+            
+            if len(_symbols) < 10:
+                raise ValueError("Too few symbols returned from Coinbase API")
+                
+            return _symbols
+            
         except Exception as e:
+            logger.warning(f"Coinbase API request error: {e}")
             raise ValueError("request error") from e
-        try:
-            _symbols = resp["id"].to_list()
-        except Exception as e:
-            logger.warning(f"request error: {e}")
-            raise
-        return _symbols
 
-    if _CG_CRYPTO_SYMBOLS is None:
-        _all_symbols = _get_coingecko()
+    if _CB_CRYPTO_SYMBOLS is None:
+        _all_symbols = _get_coinbase_products()
+        _CB_CRYPTO_SYMBOLS = sorted(set(_all_symbols))
 
-        _CG_CRYPTO_SYMBOLS = sorted(set(_all_symbols))
-
-    return _CG_CRYPTO_SYMBOLS
+    return _CB_CRYPTO_SYMBOLS
 
 
 class CryptoCollector(BaseCollector):
+    # Extended interval constants
+    INTERVAL_1min = "1min"
+    INTERVAL_5min = "5min"
+    INTERVAL_15min = "15min"
+    INTERVAL_30min = "30min"
+    INTERVAL_1hour = "1hour"
+    INTERVAL_1d = "1d"
+    
     def __init__(
         self,
         save_dir: [str, Path],
@@ -74,13 +95,13 @@ class CryptoCollector(BaseCollector):
         save_dir: str
             crypto save dir
         max_workers: int
-            workers, default 4
+            workers, default 1
         max_collector_count: int
             default 2
         delay: float
-            time.sleep(delay), default 0
+            time.sleep(delay), default 1
         interval: str
-            freq, value from [1min, 1d], default 1min
+            freq, value from [1min, 5min, 15min, 30min, 1hour, 1d], default 1d
         start: str
             start datetime, default None
         end: str
@@ -105,7 +126,9 @@ class CryptoCollector(BaseCollector):
         self.init_datetime()
 
     def init_datetime(self):
-        if self.interval == self.INTERVAL_1min:
+        # Handle different intervals
+        if self.interval in [self.INTERVAL_1min, self.INTERVAL_5min, self.INTERVAL_15min, 
+                           self.INTERVAL_30min, self.INTERVAL_1hour]:
             self.start_datetime = max(self.start_datetime, self.DEFAULT_START_DATETIME_1MIN)
         elif self.interval == self.INTERVAL_1d:
             pass
@@ -130,28 +153,106 @@ class CryptoCollector(BaseCollector):
         raise NotImplementedError("rewrite get_timezone")
 
     @staticmethod
-    def get_data_from_remote(symbol, interval, start, end):
+    def get_data_from_remote(symbol: str, interval: str, start: str, end: str) -> Optional[pd.DataFrame]:
+        """Get crypto data from Coinbase API
+        
+        Parameters
+        ----------
+        symbol: str
+            Cryptocurrency symbol (e.g., 'BTC', 'ETH')
+        interval: str
+            Time interval ('1min', '5min', '15min', '30min', '1hour', '1d')
+        start: str
+            Start date in YYYY-MM-DD format
+        end: str
+            End date in YYYY-MM-DD format
+            
+        Returns
+        -------
+        pd.DataFrame or None
+            DataFrame with OHLCV data or None if error
+        """
         error_msg = f"{symbol}-{interval}-{start}-{end}"
+        
         try:
-            cg = CoinGeckoAPI()
-            data = cg.get_coin_market_chart_by_id(id=symbol, vs_currency="usd", days="max")
-            _resp = pd.DataFrame(columns=["date"] + list(data.keys()))
-            _resp["date"] = [dt.fromtimestamp(mktime(time.localtime(x[0] / 1000))) for x in data["prices"]]
-            for key in data.keys():
-                _resp[key] = [x[1] for x in data[key]]
-            _resp["date"] = pd.to_datetime(_resp["date"])
-            _resp["date"] = [x.date() for x in _resp["date"]]
-            _resp = _resp[(_resp["date"] < pd.to_datetime(end).date()) & (_resp["date"] > pd.to_datetime(start).date())]
-            if _resp.shape[0] != 0:
-                _resp = _resp.reset_index()
-            if isinstance(_resp, pd.DataFrame):
-                return _resp.reset_index()
+            # Convert dates to ISO format for Coinbase API
+            start_dt = pd.to_datetime(start)
+            end_dt = pd.to_datetime(end)
+            
+            # Extended Coinbase API granularity mapping
+            granularity_map = {
+                "1min": 60,
+                "5min": 300,
+                "15min": 900,
+                "30min": 1800,
+                "1hour": 3600,
+                "1d": 86400
+            }
+            
+            if interval not in granularity_map:
+                raise ValueError(f"Unsupported interval: {interval}. Supported intervals: {list(granularity_map.keys())}")
+            
+            granularity = granularity_map[interval]
+            
+            # Coinbase API endpoint for candles
+            url = f"https://api.exchange.coinbase.com/products/{symbol}-USD/candles"
+            
+            params = {
+                'start': start_dt.isoformat(),
+                'end': end_dt.isoformat(),
+                'granularity': granularity
+            }
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            resp = requests.get(url, params=params, headers=headers, timeout=30)
+            resp.raise_for_status()
+            
+            data = resp.json()
+            
+            if not data:
+                logger.warning(f"No data returned for {symbol}")
+                return None
+            
+            # Coinbase candle format: [timestamp, open, high, low, close, volume]
+            df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            
+            # Convert timestamp to datetime
+            df['date'] = pd.to_datetime(df['timestamp'], unit='s')
+            
+            # For intraday intervals, keep full datetime
+            if interval in ["1min", "5min", "15min", "30min", "1hour"]:
+                df['date'] = pd.to_datetime(df['date'])
+            else:
+                df['date'] = df['date'].dt.date
+            
+            # Filter by date range
+            df = df[
+                (df['date'] >= pd.to_datetime(start)) & 
+                (df['date'] < pd.to_datetime(end))
+            ]
+            
+            if df.empty:
+                logger.warning(f"No data in date range for {symbol}")
+                return None
+            
+            # Add symbol column
+            df['symbol'] = symbol
+            
+            # Reorder columns
+            df = df[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
+            
+            return df.reset_index(drop=True)
+            
         except Exception as e:
-            logger.warning(f"{error_msg}:{e}")
+            logger.warning(f"{error_msg}: {e}")
+            return None
 
     def get_data(
         self, symbol: str, interval: str, start_datetime: pd.Timestamp, end_datetime: pd.Timestamp
-    ) -> [pd.DataFrame]:
+    ) -> Optional[pd.DataFrame]:
         def _get_simple(start_, end_):
             self.sleep()
             _remote_interval = interval
@@ -162,17 +263,21 @@ class CryptoCollector(BaseCollector):
                 end=end_,
             )
 
-        if interval == self.INTERVAL_1d:
+        # Support all intervals
+        supported_intervals = [self.INTERVAL_1min, self.INTERVAL_5min, self.INTERVAL_15min, 
+                             self.INTERVAL_30min, self.INTERVAL_1hour, self.INTERVAL_1d]
+        
+        if interval in supported_intervals:
             _result = _get_simple(start_datetime, end_datetime)
         else:
-            raise ValueError(f"cannot support {interval}")
+            raise ValueError(f"cannot support {interval}. Supported intervals: {supported_intervals}")
         return _result
 
 
 class CryptoCollector1d(CryptoCollector, ABC):
     def get_instrument_list(self):
-        logger.info("get coingecko crypto symbols......")
-        symbols = get_cg_crypto_symbols()
+        logger.info("get Coinbase crypto symbols......")
+        symbols = get_cb_crypto_symbols()
         logger.info(f"get {len(symbols)} symbols.")
         return symbols
 
@@ -181,7 +286,97 @@ class CryptoCollector1d(CryptoCollector, ABC):
 
     @property
     def _timezone(self):
-        return "Asia/Shanghai"
+        return "UTC"  # Coinbase uses UTC
+
+
+class CryptoCollector1min(CryptoCollector, ABC):
+    def get_instrument_list(self):
+        logger.info("get Coinbase crypto symbols for 1min data......")
+        symbols = get_cb_crypto_symbols()
+        # For 1min data, we might want to limit to major cryptocurrencies
+        major_symbols = ['BTC', 'ETH', 'USDC', 'USDT', 'SOL', 'ADA', 'DOT', 'AVAX', 'MATIC', 'LINK']
+        available_symbols = [s for s in major_symbols if s in symbols]
+        logger.info(f"get {len(available_symbols)} major symbols for 1min data.")
+        return available_symbols
+
+    def normalize_symbol(self, symbol):
+        return symbol
+
+    @property
+    def _timezone(self):
+        return "UTC"  # Coinbase uses UTC
+
+
+class CryptoCollector5min(CryptoCollector, ABC):
+    def get_instrument_list(self):
+        logger.info("get Coinbase crypto symbols for 5min data......")
+        symbols = get_cb_crypto_symbols()
+        # For 5min data, limit to major cryptocurrencies
+        major_symbols = ['BTC', 'ETH', 'USDC', 'USDT', 'SOL', 'ADA', 'DOT', 'AVAX', 'MATIC', 'LINK', 'UNI', 'ATOM']
+        available_symbols = [s for s in major_symbols if s in symbols]
+        logger.info(f"get {len(available_symbols)} major symbols for 5min data.")
+        return available_symbols
+
+    def normalize_symbol(self, symbol):
+        return symbol
+
+    @property
+    def _timezone(self):
+        return "UTC"
+
+
+class CryptoCollector15min(CryptoCollector, ABC):
+    def get_instrument_list(self):
+        logger.info("get Coinbase crypto symbols for 15min data......")
+        symbols = get_cb_crypto_symbols()
+        # For 15min data, limit to major cryptocurrencies
+        major_symbols = ['BTC', 'ETH', 'USDC', 'USDT', 'SOL', 'ADA', 'DOT', 'AVAX', 'MATIC', 'LINK', 'UNI', 'ATOM', 'LTC', 'BCH']
+        available_symbols = [s for s in major_symbols if s in symbols]
+        logger.info(f"get {len(available_symbols)} major symbols for 15min data.")
+        return available_symbols
+
+    def normalize_symbol(self, symbol):
+        return symbol
+
+    @property
+    def _timezone(self):
+        return "UTC"
+
+
+class CryptoCollector30min(CryptoCollector, ABC):
+    def get_instrument_list(self):
+        logger.info("get Coinbase crypto symbols for 30min data......")
+        symbols = get_cb_crypto_symbols()
+        # For 30min data, limit to major cryptocurrencies
+        major_symbols = ['BTC', 'ETH', 'USDC', 'USDT', 'SOL', 'ADA', 'DOT', 'AVAX', 'MATIC', 'LINK', 'UNI', 'ATOM', 'LTC', 'BCH', 'XLM']
+        available_symbols = [s for s in major_symbols if s in symbols]
+        logger.info(f"get {len(available_symbols)} major symbols for 30min data.")
+        return available_symbols
+
+    def normalize_symbol(self, symbol):
+        return symbol
+
+    @property
+    def _timezone(self):
+        return "UTC"
+
+
+class CryptoCollector1hour(CryptoCollector, ABC):
+    def get_instrument_list(self):
+        logger.info("get Coinbase crypto symbols for 1hour data......")
+        symbols = get_cb_crypto_symbols()
+        # For 1hour data, limit to major cryptocurrencies
+        major_symbols = ['BTC', 'ETH', 'USDC', 'USDT', 'SOL', 'ADA', 'DOT', 'AVAX', 'MATIC', 'LINK', 'UNI', 'ATOM', 'LTC', 'BCH', 'XLM', 'ETC']
+        available_symbols = [s for s in major_symbols if s in symbols]
+        logger.info(f"get {len(available_symbols)} major symbols for 1hour data.")
+        return available_symbols
+
+    def normalize_symbol(self, symbol):
+        return symbol
+
+    @property
+    def _timezone(self):
+        return "UTC"
 
 
 class CryptoNormalize(BaseNormalize):
@@ -224,6 +419,31 @@ class CryptoNormalize1d(CryptoNormalize):
         return None
 
 
+class CryptoNormalize1min(CryptoNormalize):
+    def _get_calendar_list(self):
+        return None
+
+
+class CryptoNormalize5min(CryptoNormalize):
+    def _get_calendar_list(self):
+        return None
+
+
+class CryptoNormalize15min(CryptoNormalize):
+    def _get_calendar_list(self):
+        return None
+
+
+class CryptoNormalize30min(CryptoNormalize):
+    def _get_calendar_list(self):
+        return None
+
+
+class CryptoNormalize1hour(CryptoNormalize):
+    def _get_calendar_list(self):
+        return None
+
+
 class Run(BaseRun):
     def __init__(self, source_dir=None, normalize_dir=None, max_workers=1, interval="1d"):
         """
@@ -237,7 +457,7 @@ class Run(BaseRun):
         max_workers: int
             Concurrent number, default is 1
         interval: str
-            freq, value from [1min, 1d], default 1d
+            freq, value from [1min, 5min, 15min, 30min, 1hour, 1d], default 1d
         """
         super().__init__(source_dir, normalize_dir, max_workers, interval)
 
@@ -256,27 +476,27 @@ class Run(BaseRun):
     def download_data(
         self,
         max_collector_count=2,
-        delay=0,
+        delay=1,
         start=None,
         end=None,
         check_data_length: int = None,
         limit_nums=None,
     ):
-        """download data from Internet
+        """download data from Coinbase
 
         Parameters
         ----------
         max_collector_count: int
             default 2
         delay: float
-            time.sleep(delay), default 0
+            time.sleep(delay), default 1
         interval: str
-            freq, value from [1min, 1d], default 1d, currently only supprot 1d
+            freq, value from [1min, 5min, 15min, 30min, 1hour, 1d], default 1d
         start: str
             start datetime, default "2000-01-01"
         end: str
             end datetime, default ``pd.Timestamp(datetime.datetime.now() + pd.Timedelta(days=1))``
-        check_data_length: int # if this param useful?
+        check_data_length: int
             check data length, if not None and greater than 0, each symbol will be considered complete if its data length is greater than or equal to this value, otherwise it will be fetched again, the maximum number of fetches being (max_collector_count). By default None.
         limit_nums: int
             using for debug, by default None
@@ -285,6 +505,12 @@ class Run(BaseRun):
         ---------
             # get daily data
             $ python collector.py download_data --source_dir ~/.qlib/crypto_data/source/1d --start 2015-01-01 --end 2021-11-30 --delay 1 --interval 1d
+            
+            # get 15min data
+            $ python collector.py download_data --source_dir ~/.qlib/crypto_data/source/15min --start 2024-01-01 --end 2024-01-31 --delay 1 --interval 15min
+            
+            # get 1hour data
+            $ python collector.py download_data --source_dir ~/.qlib/crypto_data/source/1hour --start 2024-01-01 --end 2024-01-31 --delay 1 --interval 1hour
         """
 
         super(Run, self).download_data(max_collector_count, delay, start, end, check_data_length, limit_nums)
