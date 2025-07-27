@@ -75,7 +75,9 @@ class FundCollector(BaseCollector):
 
     def init_datetime(self):
         if self.interval == self.INTERVAL_1min:
-            self.start_datetime = max(self.start_datetime, self.DEFAULT_START_DATETIME_1MIN)
+            # Convert both to pd.Timestamp for comparison
+            default_start = pd.Timestamp(self.DEFAULT_START_DATETIME_1MIN)
+            self.start_datetime = max(self.start_datetime, default_start)
         elif self.interval == self.INTERVAL_1d:
             pass
         else:

@@ -129,7 +129,10 @@ class CryptoCollector(BaseCollector):
         # Handle different intervals
         if self.interval in [self.INTERVAL_1min, self.INTERVAL_5min, self.INTERVAL_15min, 
                            self.INTERVAL_30min, self.INTERVAL_1hour]:
-            self.start_datetime = max(self.start_datetime, self.DEFAULT_START_DATETIME_1MIN)
+            # Convert both to pd.Timestamp for comparison
+            default_start = pd.Timestamp(self.DEFAULT_START_DATETIME_1MIN)
+            # Do not use max, because max will convert the type of start_datetime to datetime.date
+            # self.start_datetime = max(self.start_datetime, default_start)
         elif self.interval == self.INTERVAL_1d:
             pass
         else:
@@ -175,9 +178,9 @@ class CryptoCollector(BaseCollector):
         error_msg = f"{symbol}-{interval}-{start}-{end}"
         
         try:
-            # Convert dates to ISO format for Coinbase API
-            start_dt = pd.to_datetime(start)
-            end_dt = pd.to_datetime(end)
+            # Convert dates to UTC ISO format for Coinbase API
+            start_dt = pd.to_datetime(start).tz_localize(None).tz_localize('UTC')
+            end_dt = pd.to_datetime(end).tz_localize(None).tz_localize('UTC')
             
             # Extended Coinbase API granularity mapping
             granularity_map = {
@@ -194,45 +197,86 @@ class CryptoCollector(BaseCollector):
             
             granularity = granularity_map[interval]
             
-            # Coinbase API endpoint for candles
-            url = f"https://api.exchange.coinbase.com/products/{symbol}-USD/candles"
-            
-            params = {
-                'start': start_dt.isoformat(),
-                'end': end_dt.isoformat(),
-                'granularity': granularity
+            # Calculate chunk size based on granularity to stay under 300 data points limit
+            # Coinbase API has a limit of 300 data points per request
+            max_points = 300
+            chunk_duration_map = {
+                "1min": pd.Timedelta(hours=5),      # 300 minutes
+                "5min": pd.Timedelta(hours=25),     # 300 * 5 minutes
+                "15min": pd.Timedelta(hours=75),    # 300 * 15 minutes
+                "30min": pd.Timedelta(hours=150),   # 300 * 30 minutes
+                "1hour": pd.Timedelta(hours=300),   # 300 hours
+                "1d": pd.Timedelta(days=300)        # 300 days
             }
             
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+            chunk_duration = chunk_duration_map[interval]
             
-            resp = requests.get(url, params=params, headers=headers, timeout=30)
-            resp.raise_for_status()
+            # Collect data in chunks
+            all_data = []
+            current_start = start_dt
             
-            data = resp.json()
+            while current_start < end_dt:
+                current_end = min(current_start + chunk_duration, end_dt)
+                
+                # Coinbase API endpoint for candles
+                url = f"https://api.exchange.coinbase.com/products/{symbol}-USD/candles"
+                
+                params = {
+                    'start': current_start.isoformat(),
+                    'end': current_end.isoformat(),
+                    'granularity': granularity
+                }
+                
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                
+                resp = requests.get(url, params=params, headers=headers, timeout=30)
+                resp.raise_for_status()
+                
+                chunk_data = resp.json()
+                
+                if chunk_data:
+                    all_data.extend(chunk_data)
+                
+                current_start = current_end
             
-            if not data:
+            if not all_data:
                 logger.warning(f"No data returned for {symbol}")
                 return None
             
             # Coinbase candle format: [timestamp, open, high, low, close, volume]
-            df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
             # Convert timestamp to datetime
             df['date'] = pd.to_datetime(df['timestamp'], unit='s')
             
             # For intraday intervals, keep full datetime
             if interval in ["1min", "5min", "15min", "30min", "1hour"]:
+                # Ensure we have datetime objects for intraday intervals
                 df['date'] = pd.to_datetime(df['date'])
             else:
-                df['date'] = df['date'].dt.date
+                # For daily intervals, convert to date objects
+                df['date'] = pd.to_datetime(df['date']).dt.date
             
-            # Filter by date range
-            df = df[
-                (df['date'] >= pd.to_datetime(start)) & 
-                (df['date'] < pd.to_datetime(end))
-            ]
+            # Filter by date range - ensure consistent datetime types
+            if not df.empty:
+                if interval in ["1min", "5min", "15min", "30min", "1hour"]:
+                    # For intraday intervals, compare datetime with datetime
+                    start_dt = pd.to_datetime(start).tz_localize(None)
+                    end_dt = pd.to_datetime(end).tz_localize(None)
+                    # Convert DataFrame dates to list for comparison
+                    date_list = df['date'].tolist()
+                    mask = [(d >= start_dt) and (d < end_dt) for d in date_list]
+                    df = df[mask]
+                else:
+                    # For daily intervals, compare date with date
+                    start_dt = pd.to_datetime(start).date()
+                    end_dt = pd.to_datetime(end).date()
+                    df = df[
+                        (df['date'] >= start_dt) & 
+                        (df['date'] < end_dt)
+                    ]
             
             if df.empty:
                 logger.warning(f"No data in date range for {symbol}")
@@ -248,6 +292,7 @@ class CryptoCollector(BaseCollector):
             
         except Exception as e:
             logger.warning(f"{error_msg}: {e}")
+            logger.warning(f"DataFrame info: shape={df.shape if 'df' in locals() else 'N/A'}, columns={df.columns.tolist() if 'df' in locals() and not df.empty else 'N/A'}")
             return None
 
     def get_data(
